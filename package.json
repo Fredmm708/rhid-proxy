@@ -1,0 +1,12 @@
+{
+  "name": "brewteco-rhid-proxy",
+  "version": "1.0.0",
+  "description": "Proxy serverless para integração RHiD × Dashboard Brewteco GGC",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
