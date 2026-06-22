@@ -1,95 +1,118 @@
-const RHID_BASE = 'https://www.rhid.com.br';
+// api/rhid.js
+// Proxy serverless (Vercel) para a API do RHiD (Control iD).
+//
+// Endpoint base confirmado oficialmente pela equipe de Integração da Control iD
+// (e-mail de Lucas Pereira, 22/06/2026):
+//   Base:  https://www.rhid.com.br/v2/api.svc
+//   Login: POST /login   body: { email, password, domain? }
+//   Retorna um bearer token válido por 4 horas, usado via header
+//   "Authorization: Bearer {token}" em todas as demais chamadas.
+//
+// Documentação completa (Swagger):
+//   https://www.rhid.com.br/v2/swagger.svc/index.html?url=/v2/swagger.svc/swagger.json
+//
+// Este proxy existe para contornar o bloqueio de CORS do servidor RHiD,
+// que não envia headers Access-Control-Allow-Origin permissivos.
 
-module.exports = async function handler(req, res) {
+const RHID_BASE = 'https://www.rhid.com.br/v2/api.svc';
+
+module.exports = async (req, res) => {
+  // ── CORS ──────────────────────────────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
-
-  const action = req.query.action;
-  const body = req.body || {};
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
 
   try {
+    const action = (req.query && req.query.action) || (req.body && req.body.action);
 
-    // ── LOGIN — padrão Control iD: POST /login.fcgi ──────────
+    if (!action) {
+      return res.status(400).json({
+        error: 'Parametro "action" ausente.',
+        acoes_disponiveis: ['login', 'proxy'],
+      });
+    }
+
+    // ── LOGIN ──────────────────────────────────────────────────────
+    // POST /api/rhid?action=login
+    // body: { email, password, domain? }
     if (action === 'login') {
-      const login = body.login;
-      const password = body.password;
-      if (!login || !password) {
-        return res.status(400).json({ error: 'Informe login e password.' });
+      const { email, password, domain } = req.body || {};
+
+      if (!email || !password) {
+        return res.status(400).json({ error: 'email e password são obrigatórios.' });
       }
 
-      const r = await fetch(RHID_BASE + '/login.fcgi', {
+      const loginBody = { email, password };
+      if (domain) loginBody.domain = domain;
+
+      const r = await fetch(`${RHID_BASE}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ login: login, password: password })
+        body: JSON.stringify(loginBody),
       });
 
       const text = await r.text();
       let data;
-      try { data = JSON.parse(text); } catch(e) { data = { raw: text.substring(0, 300) }; }
-
-      if (!r.ok || !data.session) {
-        return res.status(401).json({
-          error: 'Login falhou ou session ausente.',
+      try {
+        data = JSON.parse(text);
+      } catch {
+        // Resposta não-JSON (ex: página de erro HTML do IIS/WCF) — devolve o texto bruto
+        // para facilitar o diagnóstico, em vez de quebrar o fetch do front-end.
+        return res.status(r.status).json({
+          error: 'Resposta não-JSON do RHiD.',
           status: r.status,
-          response: data
+          raw: text.slice(0, 2000),
         });
       }
 
-      // "session" é o token a ser reutilizado nas próximas chamadas
-      return res.status(200).json({ token: data.session, raw: data });
-    }
-
-    // ── RESUMO POR EMPRESA ────────────────────────────────────
-    if (action === 'resumo') {
-      const token = req.query.token;
-      const inicio = req.query.inicio || '';
-      const fim = req.query.fim || '';
-      if (!token) return res.status(401).json({ error: 'Token (session) ausente.' });
-
-      const r = await fetch(
-        RHID_BASE + '/load_objects.fcgi?session=' + encodeURIComponent(token),
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ object: 'resumo_empresa', inicio, fim })
-        }
-      );
-      const text = await r.text();
-      let data;
-      try { data = JSON.parse(text); } catch(e) { data = { raw: text.substring(0,300) }; }
       return res.status(r.ok ? 200 : r.status).json(data);
     }
 
-    // ── PROXY GENÉRICO — para qualquer objeto via load_objects.fcgi ──
-    if (action === 'load_objects') {
-      const token = req.query.token;
-      const objectName = req.query.object;
-      if (!token) return res.status(401).json({ error: 'Token (session) ausente.' });
-      if (!objectName) return res.status(400).json({ error: 'Parâmetro object ausente.' });
+    // ── PROXY GENÉRICO ─────────────────────────────────────────────
+    // Usado para qualquer outro endpoint documentado no Swagger, ex:
+    // POST /api/rhid?action=proxy
+    // body: { token, method: 'GET', endpoint: '/funcionarios', body: {...} }
+    if (action === 'proxy') {
+      const { token, method = 'GET', endpoint, body: pb } = req.body || {};
 
-      const r = await fetch(
-        RHID_BASE + '/load_objects.fcgi?session=' + encodeURIComponent(token),
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body && Object.keys(body).length ? body : { object: objectName })
-        }
-      );
+      if (!token) return res.status(401).json({ error: 'Token JWT ausente.' });
+      if (!endpoint) return res.status(400).json({ error: 'Endpoint ausente.' });
+
+      const r = await fetch(`${RHID_BASE}${endpoint}`, {
+        method,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: method !== 'GET' && pb ? JSON.stringify(pb) : undefined,
+      });
+
       const text = await r.text();
       let data;
-      try { data = JSON.parse(text); } catch(e) { data = { raw: text.substring(0,300) }; }
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return res.status(r.status).json({
+          error: 'Resposta não-JSON do RHiD.',
+          status: r.status,
+          raw: text.slice(0, 2000),
+        });
+      }
+
       return res.status(r.ok ? 200 : r.status).json(data);
     }
 
     return res.status(400).json({
-      error: 'Acao invalida.',
-      acoes_disponiveis: ['login', 'resumo', 'load_objects']
+      error: 'Ação inválida.',
+      acoes_disponiveis: ['login', 'proxy'],
     });
 
   } catch (err) {
-    return res.status(500).json({ error: 'Erro no proxy.', detail: err.message });
+    console.error('[RHiD Proxy Error]', err.message);
+    return res.status(500).json({ error: 'Erro interno no proxy.', detail: err.message });
   }
 };
